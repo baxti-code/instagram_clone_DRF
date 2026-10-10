@@ -1,0 +1,214 @@
+from .models import User, UserConfirmation, NEW, VIA_EMAIL, VIA_PHONE, CODE_VERIFIED, DONE, PHOTO_STEP
+from rest_framework.validators import ValidationError
+from rest_framework.exceptions import PermissionDenied
+from rest_framework import serializers
+from .utility import check_email_or_phone, send_email, check_user_type
+from django.contrib.auth.password_validation import validate_password
+from django.contrib.auth import authenticate
+from django.core.validators import FileExtensionValidator
+from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
+
+class SignUpSerializer(serializers.ModelSerializer):
+    id = serializers.UUIDField(read_only = True)
+    
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields['email_phone_number'] = serializers.CharField(required = False)
+        
+    class Meta:
+        model = User
+        fields = ('id', 'auth_type', 'auth_status')
+        
+        extra_kwargs = {
+            'auth_type':{'read_only': True, 'required':False},
+            'auth_status': {'read_only': True, 'required': False}
+        }
+    
+    def create(self, validated_data):
+        user = super().create(validated_data)
+        if user.auth_type == VIA_EMAIL:
+            code = user.generate_verification_code(VIA_EMAIL)
+            print(code)
+            send_email(user.email, code)
+        elif user.auth_type == VIA_PHONE:
+            code = user.generate_verification_code(VIA_PHONE)
+            send_email(user.phone_number, code)
+            # send_phone_code(user.phone_number, code)
+        user.save()
+        return user
+    
+    def validate(self, data):
+        super().validate(data)
+        data = self.auth_validate(data)
+        return data
+        
+    @staticmethod
+    def auth_validate(data):
+        user_input = str(data.get('email_phone_number')).lower()
+        input_type = check_email_or_phone(user_input)
+        if input_type == 'email':
+            data = {
+                'email':user_input,
+                'auth_type':VIA_EMAIL
+            }
+        elif input_type == 'phone':
+            data = {
+                'phone_number':user_input,
+                'auth_type': VIA_PHONE
+            }
+        else:
+            data = {
+                'success':False,
+                'message': "You must send email or phone number"
+            }
+            raise ValidationError
+        
+        return data
+    def validate_email_phone_number(self, value):
+        if not value:
+            return value
+        value = value.lower()
+        if value and User.objects.filter(email = value).exists():
+            data = {
+                'success': False,
+                'message': 'This email is already registered'
+            }
+            raise ValidationError(data)
+        
+        elif value and User.objects.filter(phone_number = value).exists():
+            data = {
+                'success': False,
+                'message': 'This phone number is already registered'
+            }
+            raise ValidationError(data)
+        
+        return value
+    
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        data.update(instance.token())
+        return data
+    
+class ChangeUserInfoSerializer(serializers.Serializer):
+    username = serializers.CharField(write_only=True, required =True)
+    first_name = serializers.CharField(write_only=True, required=True)
+    last_name = serializers.CharField(write_only=True, required=True)
+    password = serializers.CharField(write_only=True, required=True)
+    confirm_password = serializers.CharField(write_only=True, required=True)
+    
+    def validate(self, data):
+        password = data.get('password', None)
+        confirm_password = data.get('confirm_password', None)
+        if password != confirm_password:
+            raise ValidationError(
+                {
+                    'message':'Passwords didn\'t match'
+                }
+            )
+        if password:
+            validate_password(password)
+        return data
+    
+    def validate_username(self, username):
+        if len(username) < 5 or len(username)> 30:
+            raise ValidationError(
+                {
+                    'message':'Username must be between 5 and 30 characters'
+                }
+            )
+        if username.isdigit():
+            raise ValidationError(
+                {
+                    'message':'Username can\'t be all numeric'
+                }
+            )
+        return username
+    
+    def update(self, instance, validated_data):
+        instance.username = validated_data.get('username', instance.username)
+        instance.first_name = validated_data.get('first_name', instance.first_name)
+        instance.last_name = validated_data.get('last_name', instance.last_name)
+        instance.password = validated_data.get('password', instance.password)
+        
+        if validated_data.get('password'):
+            instance.set_password(validated_data.get('password'))
+        if instance.auth_status == CODE_VERIFIED:
+            instance.auth_status = DONE
+            
+        instance.save()
+        return instance
+    
+class ChangeUserPhotoSerializer(serializers.Serializer):
+    photo = serializers.ImageField(validators = [FileExtensionValidator(allowed_extensions=
+            ['jpg', 'jpeg', 'heic', 'heif', 'png'])])
+    def update(self, instance, validated_data):
+        photo = validated_data.get('photo')
+        if photo:
+            instance.photo = photo
+            instance.auth_status = PHOTO_STEP
+            instance.save()
+        return instance
+    
+class LoginSerializer(TokenObtainPairSerializer):
+    
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields['username'] = serializers.CharField(required = False, read_only=True)
+        self.fields['user_input'] = serializers.CharField(required=True)
+        
+    def auth_validate(self, data):
+        user_input = data.get('user_input')
+        if check_user_type(user_input) == 'username':
+            username = user_input
+        elif check_user_type(user_input) == 'email':
+            user = User.objects.get(email__iexact=user_input)
+            username = user.username
+        elif check_user_type(user_input) == 'phone_number':
+            user = User.objects.get(phone_number = user_input)
+            username = user.username
+        else:
+            raise ValidationError(
+                {
+                    'success' : False,
+                    'message':'No account found'
+                }
+            )
+        authentication_kwargs = {
+            self.username_field: username,
+            'password': data['password'],
+        }
+        
+        current_user = User.objects.filter(username__iexact = username).first() #None
+       
+        if current_user is not None and current_user.auth_status in [NEW, CODE_VERIFIED]:
+            data = {
+                'success': False,
+                'message': 'Your registeration isn\'t completed',
+            }
+            raise ValidationError(data)
+        
+        user = authenticate(**authentication_kwargs)
+        if user is not None:
+            self.user = user
+        else:
+            raise ValidationError({
+                'success':False,
+                'message':'Username or password is incorrect'
+            })
+            
+    def validate(self, data):
+        self.auth_validate(data)
+        if self.user.auth_status not in [DONE, PHOTO_STEP]:
+            raise PermissionDenied("You can't login. You don't have access")
+        data = self.user.token()
+        data['auth_status'] = self.user.auth_status
+        data['full_name'] = self.user.full_name
+        return data
+    def get_user(self, **kwargs):
+        users = User.objects.filter(**kwargs)
+        if not users.exists():
+            raise ValidationError({
+                'success':'False',
+                'message': 'No active account found'
+            })
+        return users.first()
