@@ -1,15 +1,21 @@
 from .models import User, NEW, CODE_VERIFIED, VIA_EMAIL, VIA_PHONE
 from rest_framework.response import Response
-from .serializers import SignUpSerializer, ChangeUserInfoSerializer, ChangeUserPhotoSerializer, LoginSerializer
+from .serializers import SignUpSerializer, ChangeUserInfoSerializer,\
+    ChangeUserPhotoSerializer, LoginSerializer, LoginRefreshSerializer, LogOutSerializer, \
+        ForgotPasswordSerializer, ResetPasswordSerializer
 from rest_framework.generics import CreateAPIView, UpdateAPIView
 from rest_framework.views import APIView
 from rest_framework import permissions
 from rest_framework.decorators import permission_classes
 from django.utils import timezone
-from rest_framework.exceptions import ValidationError
-from .utility import send_email, send_phone_code
-from rest_framework_simplejwt.views import TokenObtainPairView
-
+from rest_framework.exceptions import ValidationError, NotFound
+from .utility import send_email, send_phone_code, check_email_or_phone
+from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
+from rest_framework_simplejwt.tokens import RefreshToken
+from rest_framework_simplejwt.exceptions import TokenError
+from django.db.models import Q
+from django.core.exceptions import ObjectDoesNotExist
+# def check_email_or_phone(email_phone_number):
 class CreateUserView(CreateAPIView):
     queryset = User.objects.all()
     serializer_class = SignUpSerializer
@@ -132,3 +138,95 @@ class ChangeUserPhotoView(APIView):
             
 class LoginView(TokenObtainPairView):
     serializer_class = LoginSerializer
+
+class LoginRefreshView(TokenRefreshView):
+    serializer_class = LoginRefreshSerializer
+    
+class LogOutView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = LogOutSerializer
+    
+    def post(self, request, *args, **kwargs):
+        serializer = self.serializer_class(data=self.request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            refresh_token = self.request.data['refresh']
+            token = RefreshToken(refresh_token)
+            token.blacklist()
+            data = {
+                'success':True ,
+                'message':'You are logged out'
+            }
+            return Response(data, status=205)
+        except TokenError:
+            return Response(status=400)
+        
+class ForgotPasswordView(APIView):
+    permission_classes = [permissions.AllowAny]
+    serializer_class = ForgotPasswordSerializer
+    
+    def post(self, request, *args, **kwargs):
+        serializer = self.serializer_class(data=self.request.data)
+        serializer.is_valid(raise_exception=True)
+        email_or_phone = serializer.validated_data.get('email_or_phone')
+        user = serializer.validated_data.get('user')
+        if check_email_or_phone(email_or_phone)== 'phone':
+            code = user.generate_verification_code(VIA_PHONE)
+            send_email(email_or_phone, code)
+        if check_email_or_phone(email_or_phone) == 'email':
+            code = user.generate_verification_code(VIA_EMAIL)
+            send_email(email_or_phone, code)
+            
+        return Response(
+            {
+                "success": True,
+                'message': "Code sent successfully",
+            }, status=200
+        )
+        
+class ForgotPasswordVerifyAPIView(APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request, *args, **kwargs):
+        email_or_phone = request.data.get('email_or_phone')
+        code = request.data.get('code')
+
+        user = User.objects.filter(
+            Q(phone_number=email_or_phone) | Q(email=email_or_phone)
+        ).first()
+        if not user:
+            raise NotFound(detail="User not found")
+
+        VerifyAPIView.check_verify(user, code)   # staticmethod bo'lgani uchun qayta ishlatish mumkin
+        token_data = user.token()
+
+        return Response(
+            data={
+                'success': True,
+                'access': token_data['access'],
+                'refresh': token_data['refresh_token']
+            }
+        )
+        
+class ResetPasswordAPIView(UpdateAPIView):
+    serializer_class = ResetPasswordSerializer
+    http_method_names = ['patch', 'put']
+    permission_classes = [permissions.IsAuthenticated]
+    
+    def get_object(self):
+        return self.request.user
+    
+    def update(self, request, *args, **kwargs):
+        response = super().update(request, *args, **kwargs)
+        try:
+            user = User.objects.get(id=response.data.get('id'))
+        except ObjectDoesNotExist as e:
+            raise NotFound(detail='User not found')
+        return Response(
+            {
+                'success': True,
+                'message': "Parolingiz muvaffaqiyatli o'zgartirildi",
+                'access': user.token()['access'],
+                'refresh': user.token()['refresh_token'],
+            }
+        )
